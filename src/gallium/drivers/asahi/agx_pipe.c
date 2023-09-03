@@ -551,7 +551,7 @@ agx_resource_create_with_modifiers(struct pipe_screen *screen,
     * inferring the shader image flag. Do so to avoid reallocation in case the
     * resource is later used as an image.
     */
-   if (nresource->modifier == DRM_FORMAT_MOD_APPLE_TWIDDLED &&
+   if (nresource->modifier != DRM_FORMAT_MOD_APPLE_TWIDDLED_COMPRESSED &&
        templ->depth0 == 1) {
 
       nresource->base.bind |= PIPE_BIND_SHADER_IMAGE;
@@ -871,9 +871,9 @@ agx_alloc_staging(struct pipe_screen *screen, struct agx_resource *rsc,
 
    tmpl.last_level = 0;
 
-   /* Linear is incompatible with depth/stencil and shader images, so we convert */
+   /* Linear is incompatible with depth/stencil, so we convert */
    tmpl.format = agx_staging_color_format_for_zs(rsc->layout.format);
-   tmpl.bind &= ~(PIPE_BIND_DEPTH_STENCIL | PIPE_BIND_SHADER_IMAGE);
+   tmpl.bind &= ~PIPE_BIND_DEPTH_STENCIL;
    tmpl.bind |= PIPE_BIND_LINEAR | PIPE_BIND_RENDER_TARGET;
 
    struct pipe_resource *pstaging = screen->resource_create(screen, &tmpl);
