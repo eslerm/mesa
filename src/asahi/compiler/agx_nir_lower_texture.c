@@ -18,6 +18,14 @@
 #define AGX_FORMAT_RGB32_EMULATED 0x36
 #define AGX_LAYOUT_LINEAR         0x0
 
+static void
+set_speculatable(nir_def *def)
+{
+   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(def->parent_instr);
+   nir_intrinsic_set_access(intr,
+                            nir_intrinsic_access(intr) | ACCESS_CAN_SPECULATE);
+}
+
 static nir_def *
 texture_descriptor_ptr_for_handle(nir_builder *b, nir_def *handle)
 {
@@ -620,8 +628,12 @@ image_texel_address(nir_builder *b, nir_intrinsic_instr *intr,
    nir_def *meta = nir_load_global_constant(b, meta_ptr, 8, 1, 64);
    nir_def *layer_stride_px = NULL;
 
+   /* At least for binding tables in GL, we can speculate texture access */
+   set_speculatable(meta);
+
    if (layered) {
       nir_def *desc = nir_load_global_constant(b, meta, 8, 3, 32);
+      set_speculatable(desc);
       meta = nir_pack_64_2x32(b, nir_trim_vector(b, desc, 2));
       layer_stride_px = nir_channel(b, desc, 2);
    }
