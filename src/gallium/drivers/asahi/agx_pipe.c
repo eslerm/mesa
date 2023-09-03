@@ -967,15 +967,8 @@ agx_transfer_map(struct pipe_context *pctx, struct pipe_resource *resource,
    /* For compression, we use a staging blit as we do not implement AGX
     * compression in software. In some cases, we could use this path for
     * twiddled too, but we don't have a use case for that yet.
-    *
-    * We also use this path if the buffer is mapped for reading and the
-    * BO is write-combine, since otherwise reading from the CPU will be
-    * extremely slow.
     */
-   if (rsrc->modifier == DRM_FORMAT_MOD_APPLE_TWIDDLED_COMPRESSED ||
-       (resource->target != PIPE_BUFFER && usage & PIPE_MAP_READ &&
-        !(rsrc->bo->flags & AGX_BO_WRITEBACK))) {
-
+   if (rsrc->modifier == DRM_FORMAT_MOD_APPLE_TWIDDLED_COMPRESSED) {
       /* Should never happen for buffers, and it's not safe */
       assert(resource->target != PIPE_BUFFER);
 
