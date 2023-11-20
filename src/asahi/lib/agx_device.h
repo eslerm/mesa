@@ -36,6 +36,7 @@ enum agx_dbg {
    AGX_DBG_SMALLTILE = BITFIELD_BIT(14),
    AGX_DBG_NOMSAA = BITFIELD_BIT(15),
    AGX_DBG_NOSHADOW = BITFIELD_BIT(16),
+   AGX_DBG_VARYINGS = BITFIELD_BIT(17),
 };
 
 /* How many power-of-two levels in the BO cache do we want? 2^14 minimum chosen
