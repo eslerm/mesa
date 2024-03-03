@@ -230,8 +230,13 @@ radv_use_dcc_for_image_early(struct radv_device *device, struct radv_image *imag
    if (device->physical_device->rad_info.gfx_level < GFX8)
       return false;
 
-   if (device->instance->debug_flags & RADV_DEBUG_NO_DCC)
+   const VkImageCompressionControlEXT *compression =
+      vk_find_struct_const(pCreateInfo->pNext, IMAGE_COMPRESSION_CONTROL_EXT);
+
+   if (device->instance->debug_flags & RADV_DEBUG_NO_DCC ||
+       (compression && compression->flags == VK_IMAGE_COMPRESSION_DISABLED_EXT)) {
       return false;
+   }
 
    if (image->shareable && image->vk.tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT)
       return false;
@@ -337,9 +342,17 @@ radv_use_fmask_for_image(const struct radv_device *device, const struct radv_ima
 }
 
 static inline bool
-radv_use_htile_for_image(const struct radv_device *device, const struct radv_image *image)
+radv_use_htile_for_image(const struct radv_device *device, const struct radv_image *image,
+                         const VkImageCreateInfo *pCreateInfo)
 {
    const enum amd_gfx_level gfx_level = device->physical_device->rad_info.gfx_level;
+
+   const VkImageCompressionControlEXT *compression =
+      vk_find_struct_const(pCreateInfo->pNext, IMAGE_COMPRESSION_CONTROL_EXT);
+
+   if (device->instance->debug_flags & RADV_DEBUG_NO_HIZ ||
+       (compression && compression->flags == VK_IMAGE_COMPRESSION_DISABLED_EXT))
+      return false;
 
    /* TODO:
     * - Investigate about mips+layers.
@@ -601,8 +614,7 @@ radv_get_surface_flags(struct radv_device *device, struct radv_image *image, uns
          flags |= RADEON_SURF_NO_STENCIL_ADJUST;
       }
 
-      if (radv_use_htile_for_image(device, image) && !(device->instance->debug_flags & RADV_DEBUG_NO_HIZ) &&
-          !(flags & RADEON_SURF_NO_RENDER_TARGET)) {
+      if (radv_use_htile_for_image(device, image, pCreateInfo) && !(flags & RADEON_SURF_NO_RENDER_TARGET)) {
          if (radv_use_tc_compat_htile_for_image(device, pCreateInfo, image_format))
             flags |= RADEON_SURF_TC_COMPATIBLE_HTILE;
       } else {
@@ -966,7 +978,7 @@ gfx9_border_color_swizzle(const struct util_format_description *desc)
 }
 
 bool
-vi_alpha_is_on_msb(struct radv_device *device, VkFormat format)
+vi_alpha_is_on_msb(const struct radv_device *device, const VkFormat format)
 {
    if (device->physical_device->rad_info.gfx_level >= GFX11)
       return false;
@@ -2191,13 +2203,14 @@ radv_image_view_init(struct radv_image_view *iview, struct radv_device *device,
    }
 
    if (iview->vk.format != image->planes[iview->plane_id].format) {
+      const struct radv_image_plane *plane = &image->planes[iview->plane_id];
       unsigned view_bw = vk_format_get_blockwidth(iview->vk.format);
       unsigned view_bh = vk_format_get_blockheight(iview->vk.format);
-      unsigned img_bw = vk_format_get_blockwidth(image->planes[iview->plane_id].format);
-      unsigned img_bh = vk_format_get_blockheight(image->planes[iview->plane_id].format);
+      unsigned plane_bw = vk_format_get_blockwidth(plane->format);
+      unsigned plane_bh = vk_format_get_blockheight(plane->format);
 
-      iview->extent.width = DIV_ROUND_UP(iview->extent.width * view_bw, img_bw);
-      iview->extent.height = DIV_ROUND_UP(iview->extent.height * view_bh, img_bh);
+      iview->extent.width = DIV_ROUND_UP(iview->extent.width * view_bw, plane_bw);
+      iview->extent.height = DIV_ROUND_UP(iview->extent.height * view_bh, plane_bh);
 
       /* Comment ported from amdvlk -
        * If we have the following image:
@@ -2225,25 +2238,25 @@ radv_image_view_init(struct radv_image_view *iview, struct radv_device *device,
        * block compatible format and the compressed format, so even if we take
        * the plain converted dimensions the physical layout is correct.
        */
-      if (device->physical_device->rad_info.gfx_level >= GFX9 && vk_format_is_block_compressed(image->vk.format) &&
+      if (device->physical_device->rad_info.gfx_level >= GFX9 && vk_format_is_block_compressed(plane->format) &&
           !vk_format_is_block_compressed(iview->vk.format)) {
          /* If we have multiple levels in the view we should ideally take the last level,
           * but the mip calculation has a max(..., 1) so walking back to the base mip in an
           * useful way is hard. */
          if (iview->vk.level_count > 1) {
-            iview->extent.width = iview->image->planes[0].surface.u.gfx9.base_mip_width;
-            iview->extent.height = iview->image->planes[0].surface.u.gfx9.base_mip_height;
+            iview->extent.width = plane->surface.u.gfx9.base_mip_width;
+            iview->extent.height = plane->surface.u.gfx9.base_mip_height;
          } else {
             unsigned lvl_width = radv_minify(image->vk.extent.width, range->baseMipLevel);
             unsigned lvl_height = radv_minify(image->vk.extent.height, range->baseMipLevel);
 
-            lvl_width = DIV_ROUND_UP(lvl_width * view_bw, img_bw);
-            lvl_height = DIV_ROUND_UP(lvl_height * view_bh, img_bh);
+            lvl_width = DIV_ROUND_UP(lvl_width * view_bw, plane_bw);
+            lvl_height = DIV_ROUND_UP(lvl_height * view_bh, plane_bh);
 
-            iview->extent.width = CLAMP(lvl_width << range->baseMipLevel, iview->extent.width,
-                                        iview->image->planes[0].surface.u.gfx9.base_mip_width);
-            iview->extent.height = CLAMP(lvl_height << range->baseMipLevel, iview->extent.height,
-                                         iview->image->planes[0].surface.u.gfx9.base_mip_height);
+            iview->extent.width =
+               CLAMP(lvl_width << range->baseMipLevel, iview->extent.width, plane->surface.u.gfx9.base_mip_width);
+            iview->extent.height =
+               CLAMP(lvl_height << range->baseMipLevel, iview->extent.height, plane->surface.u.gfx9.base_mip_height);
 
             /* If the hardware-computed extent is still be too small, on GFX10
              * we can attempt another workaround provided by addrlib that
@@ -2273,14 +2286,6 @@ radv_image_view_init(struct radv_image_view *iview, struct radv_device *device,
       radv_image_view_make_descriptor(iview, device, format, &pCreateInfo->components, min_lod, true,
                                       disable_compression, enable_compression, iview->plane_id + i, i, img_create_flags,
                                       &iview->nbc_view, sliced_3d);
-   }
-
-   if (iview->vk.aspects & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) {
-      radv_initialise_ds_surface(device, &iview->ds, iview);
-   } else {
-      bool blendable = false;
-      if (radv_is_colorbuffer_format_supported(device->physical_device, iview->vk.format, &blendable))
-         radv_initialise_color_surface(device, &iview->cb, iview);
    }
 }
 
@@ -2549,6 +2554,20 @@ radv_GetImageSubresourceLayout2KHR(VkDevice _device, VkImage _image, const VkIma
       pLayout->subresourceLayout.size = (uint64_t)surface->u.legacy.level[level].slice_size_dw * 4;
       if (image->vk.image_type == VK_IMAGE_TYPE_3D)
          pLayout->subresourceLayout.size *= u_minify(image->vk.extent.depth, level);
+   }
+
+   VkImageCompressionPropertiesEXT *image_compression_props =
+      vk_find_struct(pLayout->pNext, IMAGE_COMPRESSION_PROPERTIES_EXT);
+   if (image_compression_props) {
+      image_compression_props->imageCompressionFixedRateFlags = VK_IMAGE_COMPRESSION_FIXED_RATE_NONE_EXT;
+
+      if (image->vk.aspects & VK_IMAGE_ASPECT_DEPTH_BIT) {
+         image_compression_props->imageCompressionFlags =
+            radv_image_has_htile(image) ? VK_IMAGE_COMPRESSION_DEFAULT_EXT : VK_IMAGE_COMPRESSION_DISABLED_EXT;
+      } else {
+         image_compression_props->imageCompressionFlags =
+            radv_image_has_dcc(image) ? VK_IMAGE_COMPRESSION_DEFAULT_EXT : VK_IMAGE_COMPRESSION_DISABLED_EXT;
+      }
    }
 }
 

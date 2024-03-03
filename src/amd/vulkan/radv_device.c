@@ -82,6 +82,8 @@ typedef void *drmDevicePtr;
 #include "ac_llvm_util.h"
 #endif
 
+#include "ac_debug.h"
+
 static bool
 radv_spm_trace_enabled(struct radv_instance *instance)
 {
@@ -154,37 +156,54 @@ radv_device_finish_border_color(struct radv_device *device)
    }
 }
 
+static struct radv_shader_part *
+_radv_create_vs_prolog(struct radv_device *device, const void *_key)
+{
+   struct radv_vs_prolog_key *key = (struct radv_vs_prolog_key *)_key;
+   return radv_create_vs_prolog(device, key);
+}
+
+static uint32_t
+radv_hash_vs_prolog(const void *key_)
+{
+   const struct radv_vs_prolog_key *key = key_;
+   return _mesa_hash_data(key, sizeof(*key));
+}
+
+static bool
+radv_cmp_vs_prolog(const void *a_, const void *b_)
+{
+   const struct radv_vs_prolog_key *a = a_;
+   const struct radv_vs_prolog_key *b = b_;
+
+   return memcmp(a, b, sizeof(*a)) == 0;
+}
+
+static struct radv_shader_part_cache_ops vs_prolog_ops = {
+   .create = _radv_create_vs_prolog,
+   .hash = radv_hash_vs_prolog,
+   .equals = radv_cmp_vs_prolog,
+};
+
 static VkResult
 radv_device_init_vs_prologs(struct radv_device *device)
 {
-   u_rwlock_init(&device->vs_prologs_lock);
-   device->vs_prologs = _mesa_hash_table_create(NULL, &radv_hash_vs_prolog, &radv_cmp_vs_prolog);
-   if (!device->vs_prologs)
+   if (!radv_shader_part_cache_init(&device->vs_prologs, &vs_prolog_ops))
       return vk_error(device->physical_device->instance, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    /* don't pre-compile prologs if we want to print them */
    if (device->instance->debug_flags & RADV_DEBUG_DUMP_PROLOGS)
       return VK_SUCCESS;
 
-   struct radv_vs_input_state state;
-   state.nontrivial_divisors = 0;
-   memset(state.offsets, 0, sizeof(state.offsets));
-   state.alpha_adjust_lo = 0;
-   state.alpha_adjust_hi = 0;
-   memset(state.formats, 0, sizeof(state.formats));
-
    struct radv_vs_prolog_key key;
-   key.state = &state;
-   key.misaligned_mask = 0;
+   memset(&key, 0, sizeof(key));
    key.as_ls = false;
    key.is_ngg = device->physical_device->use_ngg;
    key.next_stage = MESA_SHADER_VERTEX;
    key.wave32 = device->physical_device->ge_wave_size == 32;
 
    for (unsigned i = 1; i <= MAX_VERTEX_ATTRIBS; i++) {
-      state.attribute_mask = BITFIELD_MASK(i);
-      state.instance_rate_inputs = 0;
-
+      key.instance_rate_inputs = 0;
       key.num_attributes = i;
 
       device->simple_vs_prologs[i - 1] = radv_create_vs_prolog(device, &key);
@@ -194,22 +213,16 @@ radv_device_init_vs_prologs(struct radv_device *device)
 
    unsigned idx = 0;
    for (unsigned num_attributes = 1; num_attributes <= 16; num_attributes++) {
-      state.attribute_mask = BITFIELD_MASK(num_attributes);
-
-      for (unsigned i = 0; i < num_attributes; i++)
-         state.divisors[i] = 1;
-
       for (unsigned count = 1; count <= num_attributes; count++) {
          for (unsigned start = 0; start <= (num_attributes - count); start++) {
-            state.instance_rate_inputs = u_bit_consecutive(start, count);
-
+            key.instance_rate_inputs = u_bit_consecutive(start, count);
             key.num_attributes = num_attributes;
 
             struct radv_shader_part *prolog = radv_create_vs_prolog(device, &key);
             if (!prolog)
                return vk_error(device->physical_device->instance, VK_ERROR_OUT_OF_DEVICE_MEMORY);
 
-            assert(idx == radv_instance_rate_prolog_index(num_attributes, state.instance_rate_inputs));
+            assert(idx == radv_instance_rate_prolog_index(num_attributes, key.instance_rate_inputs));
             device->instance_rate_vs_prologs[idx++] = prolog;
          }
       }
@@ -222,13 +235,8 @@ radv_device_init_vs_prologs(struct radv_device *device)
 static void
 radv_device_finish_vs_prologs(struct radv_device *device)
 {
-   if (device->vs_prologs) {
-      hash_table_foreach (device->vs_prologs, entry) {
-         free((void *)entry->key);
-         radv_shader_part_unref(device, entry->data);
-      }
-      _mesa_hash_table_destroy(device->vs_prologs, NULL);
-   }
+   if (device->vs_prologs.ops)
+      radv_shader_part_cache_finish(device, &device->vs_prologs);
 
    for (unsigned i = 0; i < ARRAY_SIZE(device->simple_vs_prologs); i++) {
       if (!device->simple_vs_prologs[i])
@@ -245,53 +253,63 @@ radv_device_finish_vs_prologs(struct radv_device *device)
    }
 }
 
-static VkResult
-radv_device_init_ps_epilogs(struct radv_device *device)
+static struct radv_shader_part *
+_radv_create_ps_epilog(struct radv_device *device, const void *_key)
 {
-   u_rwlock_init(&device->ps_epilogs_lock);
-
-   device->ps_epilogs = _mesa_hash_table_create(NULL, &radv_hash_ps_epilog, &radv_cmp_ps_epilog);
-   if (!device->ps_epilogs)
-      return vk_error(device->physical_device->instance, VK_ERROR_OUT_OF_HOST_MEMORY);
-
-   return VK_SUCCESS;
+   struct radv_ps_epilog_key *key = (struct radv_ps_epilog_key *)_key;
+   return radv_create_ps_epilog(device, key, NULL);
 }
 
-static void
-radv_device_finish_ps_epilogs(struct radv_device *device)
+static uint32_t
+radv_hash_ps_epilog(const void *key_)
 {
-   if (device->ps_epilogs) {
-      hash_table_foreach (device->ps_epilogs, entry) {
-         free((void *)entry->key);
-         radv_shader_part_unref(device, entry->data);
-      }
-      _mesa_hash_table_destroy(device->ps_epilogs, NULL);
-   }
+   const struct radv_ps_epilog_key *key = key_;
+   return _mesa_hash_data(key, sizeof(*key));
 }
 
-static VkResult
-radv_device_init_tcs_epilogs(struct radv_device *device)
+static bool
+radv_cmp_ps_epilog(const void *a_, const void *b_)
 {
-   u_rwlock_init(&device->tcs_epilogs_lock);
+   const struct radv_ps_epilog_key *a = a_;
+   const struct radv_ps_epilog_key *b = b_;
 
-   device->tcs_epilogs = _mesa_hash_table_create(NULL, &radv_hash_tcs_epilog, &radv_cmp_tcs_epilog);
-   if (!device->tcs_epilogs)
-      return vk_error(device->physical_device->instance, VK_ERROR_OUT_OF_HOST_MEMORY);
-
-   return VK_SUCCESS;
+   return memcmp(a, b, sizeof(*a)) == 0;
 }
 
-static void
-radv_device_finish_tcs_epilogs(struct radv_device *device)
+static struct radv_shader_part_cache_ops ps_epilog_ops = {
+   .create = _radv_create_ps_epilog,
+   .hash = radv_hash_ps_epilog,
+   .equals = radv_cmp_ps_epilog,
+};
+
+static struct radv_shader_part *
+_radv_create_tcs_epilog(struct radv_device *device, const void *_key)
 {
-   if (device->tcs_epilogs) {
-      hash_table_foreach (device->tcs_epilogs, entry) {
-         free((void *)entry->key);
-         radv_shader_part_unref(device, entry->data);
-      }
-      _mesa_hash_table_destroy(device->tcs_epilogs, NULL);
-   }
+   struct radv_tcs_epilog_key *key = (struct radv_tcs_epilog_key *)_key;
+   return radv_create_tcs_epilog(device, key);
 }
+
+static uint32_t
+radv_hash_tcs_epilog(const void *key_)
+{
+   const struct radv_tcs_epilog_key *key = key_;
+   return _mesa_hash_data(key, sizeof(*key));
+}
+
+static bool
+radv_cmp_tcs_epilog(const void *a_, const void *b_)
+{
+   const struct radv_tcs_epilog_key *a = a_;
+   const struct radv_tcs_epilog_key *b = b_;
+
+   return memcmp(a, b, sizeof(*a)) == 0;
+}
+
+static struct radv_shader_part_cache_ops tcs_epilog_ops = {
+   .create = _radv_create_tcs_epilog,
+   .hash = radv_hash_tcs_epilog,
+   .equals = radv_cmp_tcs_epilog,
+};
 
 VkResult
 radv_device_init_vrs_state(struct radv_device *device)
@@ -598,6 +616,18 @@ init_dispatch_tables(struct radv_device *device, struct radv_physical_device *ph
    add_entrypoints(&b, &vk_common_device_entrypoints, RADV_DISPATCH_TABLE_COUNT);
 }
 
+static void
+radv_report_gpuvm_fault(struct radv_device *device)
+{
+   struct radv_winsys_gpuvm_fault_info fault_info = {0};
+
+   if (!radv_vm_fault_occurred(device, &fault_info))
+      return;
+
+   fprintf(stderr, "radv: GPUVM fault detected at address 0x%08" PRIx64 ".\n", fault_info.addr);
+   ac_print_gpuvm_fault_status(stderr, device->physical_device->rad_info.gfx_level, fault_info.status);
+}
+
 static VkResult
 radv_check_status(struct vk_device *vk_device)
 {
@@ -612,15 +642,20 @@ radv_check_status(struct vk_device *vk_device)
       if (device->hw_ctx[i]) {
          status = device->ws->ctx_query_reset_status(device->hw_ctx[i]);
 
-         if (status == RADV_GUILTY_CONTEXT_RESET)
+         if (status == RADV_GUILTY_CONTEXT_RESET) {
+            radv_report_gpuvm_fault(device);
             return vk_device_set_lost(&device->vk, "GPU hung detected in this process");
-         else if (status == RADV_INNOCENT_CONTEXT_RESET)
+         } else if (status == RADV_INNOCENT_CONTEXT_RESET) {
             context_reset = true;
+         }
       }
    }
 
-   if (context_reset)
+   if (context_reset) {
+      radv_report_gpuvm_fault(device);
       return vk_device_set_lost(&device->vk, "GPU hung triggered by other process");
+   }
+
    return VK_SUCCESS;
 }
 
@@ -924,6 +959,9 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
    device->pbb_allowed =
       device->physical_device->rad_info.gfx_level >= GFX9 && !(device->instance->debug_flags & RADV_DEBUG_NOBINNING);
 
+   device->mesh_fast_launch_2 = (device->instance->perftest_flags & RADV_PERFTEST_GS_FAST_LAUNCH_2) &&
+                                device->physical_device->rad_info.gfx_level >= GFX11;
+
    /* The maximum number of scratch waves. Scratch space isn't divided
     * evenly between CUs. The number is only a function of the number of CUs.
     * We can decrease the constant to decrease the scratch buffer size.
@@ -992,9 +1030,10 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
 
       fprintf(stderr,
               "radv: Thread trace support is enabled (initial buffer size: %u MiB, "
-              "instruction timing: %s, cache counters: %s).\n",
+              "instruction timing: %s, cache counters: %s, queue events: %s).\n",
               device->sqtt.buffer_size / (1024 * 1024), radv_is_instruction_timing_enabled() ? "enabled" : "disabled",
-              radv_spm_trace_enabled(device->instance) ? "enabled" : "disabled");
+              radv_spm_trace_enabled(device->instance) ? "enabled" : "disabled",
+              radv_sqtt_queue_events_enabled() ? "enabled" : "disabled");
 
       if (radv_spm_trace_enabled(device->instance)) {
          if (device->physical_device->rad_info.gfx_level >= GFX10) {
@@ -1080,15 +1119,17 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
    }
 
    if (tcs_epilogs) {
-      result = radv_device_init_tcs_epilogs(device);
-      if (result != VK_SUCCESS)
+      if (!radv_shader_part_cache_init(&device->tcs_epilogs, &tcs_epilog_ops)) {
+         result = VK_ERROR_OUT_OF_HOST_MEMORY;
          goto fail;
+      }
    }
 
    if (ps_epilogs) {
-      result = radv_device_init_ps_epilogs(device);
-      if (result != VK_SUCCESS)
+      if (!radv_shader_part_cache_init(&device->ps_epilogs, &ps_epilog_ops)) {
+         result = VK_ERROR_OUT_OF_HOST_MEMORY;
          goto fail;
+      }
    }
 
    if (!(device->instance->debug_flags & RADV_DEBUG_NO_IBS))
@@ -1157,8 +1198,10 @@ fail:
 
    radv_device_finish_notifier(device);
    radv_device_finish_vs_prologs(device);
-   radv_device_finish_tcs_epilogs(device);
-   radv_device_finish_ps_epilogs(device);
+   if (device->tcs_epilogs.ops)
+      radv_shader_part_cache_finish(device, &device->tcs_epilogs);
+   if (device->ps_epilogs.ops)
+      radv_shader_part_cache_finish(device, &device->ps_epilogs);
    radv_device_finish_border_color(device);
 
    radv_destroy_shader_upload_queue(device);
@@ -1210,8 +1253,10 @@ radv_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
 
    radv_device_finish_notifier(device);
    radv_device_finish_vs_prologs(device);
-   radv_device_finish_tcs_epilogs(device);
-   radv_device_finish_ps_epilogs(device);
+   if (device->tcs_epilogs.ops)
+      radv_shader_part_cache_finish(device, &device->tcs_epilogs);
+   if (device->ps_epilogs.ops)
+      radv_shader_part_cache_finish(device, &device->ps_epilogs);
    radv_device_finish_border_color(device);
    radv_device_finish_vrs_image(device);
 
@@ -1327,62 +1372,6 @@ radv_GetDeviceImageMemoryRequirements(VkDevice device, const VkDeviceImageMemory
    radv_DestroyImage(device, image, NULL);
 }
 
-void
-radv_initialise_color_surface_va(struct radv_device *device, struct radv_color_buffer_info *cb,
-                                 struct radv_image_view *iview)
-{
-   uint64_t va;
-   const struct radv_image_plane *plane = &iview->image->planes[iview->plane_id];
-   const struct radeon_surf *surf = &plane->surface;
-   uint8_t tile_swizzle = plane->surface.tile_swizzle;
-
-   uint32_t plane_id = iview->image->disjoint ? iview->plane_id : 0;
-   va = radv_buffer_get_va(iview->image->bindings[plane_id].bo) + iview->image->bindings[plane_id].offset;
-
-   if (iview->nbc_view.valid) {
-      va += iview->nbc_view.base_address_offset;
-      tile_swizzle = iview->nbc_view.tile_swizzle;
-   }
-
-   cb->cb_color_base = va >> 8;
-
-   if (device->physical_device->rad_info.gfx_level >= GFX9) {
-      cb->cb_color_base += surf->u.gfx9.surf_offset >> 8;
-      cb->cb_color_base |= tile_swizzle;
-   } else {
-      const struct legacy_surf_level *level_info = &surf->u.legacy.level[iview->vk.base_mip_level];
-
-      cb->cb_color_base += level_info->offset_256B;
-      if (level_info->mode == RADEON_SURF_MODE_2D)
-         cb->cb_color_base |= tile_swizzle;
-   }
-
-   /* CMASK variables */
-   va = radv_buffer_get_va(iview->image->bindings[0].bo) + iview->image->bindings[0].offset;
-   va += surf->cmask_offset;
-   cb->cb_color_cmask = va >> 8;
-
-   va = radv_buffer_get_va(iview->image->bindings[0].bo) + iview->image->bindings[0].offset;
-   va += surf->meta_offset;
-
-   if (radv_dcc_enabled(iview->image, iview->vk.base_mip_level) && device->physical_device->rad_info.gfx_level <= GFX8)
-      va += plane->surface.u.legacy.color.dcc_level[iview->vk.base_mip_level].dcc_offset;
-
-   unsigned dcc_tile_swizzle = tile_swizzle;
-   dcc_tile_swizzle &= ((1 << surf->meta_alignment_log2) - 1) >> 8;
-
-   cb->cb_dcc_base = va >> 8;
-   cb->cb_dcc_base |= dcc_tile_swizzle;
-
-   if (radv_image_has_fmask(iview->image)) {
-      va = radv_buffer_get_va(iview->image->bindings[0].bo) + iview->image->bindings[0].offset + surf->fmask_offset;
-      cb->cb_color_fmask = va >> 8;
-      cb->cb_color_fmask |= surf->fmask_tile_swizzle;
-   } else {
-      cb->cb_color_fmask = cb->cb_color_base;
-   }
-}
-
 VKAPI_ATTR VkResult VKAPI_CALL
 radv_BindImageMemory2(VkDevice _device, uint32_t bindInfoCount, const VkBindImageMemoryInfo *pBindInfos)
 {
@@ -1468,13 +1457,13 @@ radv_surface_max_layer_count(struct radv_image_view *iview)
                                                        : (iview->vk.base_array_layer + iview->vk.layer_count);
 }
 
-static unsigned
-get_dcc_max_uncompressed_block_size(const struct radv_device *device, const struct radv_image_view *iview)
+unsigned
+radv_get_dcc_max_uncompressed_block_size(const struct radv_device *device, const struct radv_image *image)
 {
-   if (device->physical_device->rad_info.gfx_level < GFX10 && iview->image->vk.samples > 1) {
-      if (iview->image->planes[0].surface.bpe == 1)
+   if (device->physical_device->rad_info.gfx_level < GFX10 && image->vk.samples > 1) {
+      if (image->planes[0].surface.bpe == 1)
          return V_028C78_MAX_BLOCK_SIZE_64B;
-      else if (iview->image->planes[0].surface.bpe == 2)
+      else if (image->planes[0].surface.bpe == 2)
          return V_028C78_MAX_BLOCK_SIZE_128B;
    }
 
@@ -1499,7 +1488,7 @@ get_dcc_min_compressed_block_size(const struct radv_device *device)
 static uint32_t
 radv_init_dcc_control_reg(struct radv_device *device, struct radv_image_view *iview)
 {
-   unsigned max_uncompressed_block_size = get_dcc_max_uncompressed_block_size(device, iview);
+   unsigned max_uncompressed_block_size = radv_get_dcc_max_uncompressed_block_size(device, iview->image);
    unsigned min_compressed_block_size = get_dcc_min_compressed_block_size(device);
    unsigned max_compressed_block_size;
    unsigned independent_128b_blocks;
@@ -1557,8 +1546,10 @@ radv_initialise_color_surface(struct radv_device *device, struct radv_color_buff
    const struct util_format_description *desc;
    unsigned ntype, format, swap, endian;
    unsigned blend_clamp = 0, blend_bypass = 0;
+   uint64_t va;
    const struct radv_image_plane *plane = &iview->image->planes[iview->plane_id];
    const struct radeon_surf *surf = &plane->surface;
+   uint8_t tile_swizzle = plane->surface.tile_swizzle;
 
    desc = vk_format_description(iview->vk.format);
 
@@ -1569,6 +1560,16 @@ radv_initialise_color_surface(struct radv_device *device, struct radv_color_buff
       cb->cb_color_attrib = S_028C74_FORCE_DST_ALPHA_1_GFX11(desc->swizzle[3] == PIPE_SWIZZLE_1);
    else
       cb->cb_color_attrib = S_028C74_FORCE_DST_ALPHA_1_GFX6(desc->swizzle[3] == PIPE_SWIZZLE_1);
+
+   uint32_t plane_id = iview->image->disjoint ? iview->plane_id : 0;
+   va = radv_buffer_get_va(iview->image->bindings[plane_id].bo) + iview->image->bindings[plane_id].offset;
+
+   if (iview->nbc_view.valid) {
+      va += iview->nbc_view.base_address_offset;
+      tile_swizzle = iview->nbc_view.tile_swizzle;
+   }
+
+   cb->cb_color_base = va >> 8;
 
    if (device->physical_device->rad_info.gfx_level >= GFX9) {
       if (device->physical_device->rad_info.gfx_level >= GFX11) {
@@ -1593,9 +1594,16 @@ radv_initialise_color_surface(struct radv_device *device, struct radv_color_buff
                                 S_028C74_RB_ALIGNED(meta.rb_aligned) | S_028C74_PIPE_ALIGNED(meta.pipe_aligned);
          cb->cb_mrt_epitch = S_0287A0_EPITCH(surf->u.gfx9.epitch);
       }
+
+      cb->cb_color_base += surf->u.gfx9.surf_offset >> 8;
+      cb->cb_color_base |= tile_swizzle;
    } else {
       const struct legacy_surf_level *level_info = &surf->u.legacy.level[iview->vk.base_mip_level];
       unsigned pitch_tile_max, slice_tile_max, tile_mode_index;
+
+      cb->cb_color_base += level_info->offset_256B;
+      if (level_info->mode == RADEON_SURF_MODE_2D)
+         cb->cb_color_base |= tile_swizzle;
 
       pitch_tile_max = level_info->nblk_x / 8 - 1;
       slice_tile_max = (level_info->nblk_x * level_info->nblk_y) / 64 - 1;
@@ -1621,6 +1629,23 @@ radv_initialise_color_surface(struct radv_device *device, struct radv_color_buff
       }
    }
 
+   /* CMASK variables */
+   va = radv_buffer_get_va(iview->image->bindings[0].bo) + iview->image->bindings[0].offset;
+   va += surf->cmask_offset;
+   cb->cb_color_cmask = va >> 8;
+
+   va = radv_buffer_get_va(iview->image->bindings[0].bo) + iview->image->bindings[0].offset;
+   va += surf->meta_offset;
+
+   if (radv_dcc_enabled(iview->image, iview->vk.base_mip_level) && device->physical_device->rad_info.gfx_level <= GFX8)
+      va += plane->surface.u.legacy.color.dcc_level[iview->vk.base_mip_level].dcc_offset;
+
+   unsigned dcc_tile_swizzle = tile_swizzle;
+   dcc_tile_swizzle &= ((1 << surf->meta_alignment_log2) - 1) >> 8;
+
+   cb->cb_dcc_base = va >> 8;
+   cb->cb_dcc_base |= dcc_tile_swizzle;
+
    /* GFX10 field has the same base shift as the GFX6 field. */
    uint32_t max_slice = radv_surface_max_layer_count(iview) - 1;
    uint32_t slice_start = iview->nbc_view.valid ? 0 : iview->vk.base_array_layer;
@@ -1633,6 +1658,14 @@ radv_initialise_color_surface(struct radv_device *device, struct radv_color_buff
          cb->cb_color_attrib |= S_028C74_NUM_FRAGMENTS_GFX11(log_samples);
       else
          cb->cb_color_attrib |= S_028C74_NUM_SAMPLES(log_samples) | S_028C74_NUM_FRAGMENTS_GFX6(log_samples);
+   }
+
+   if (radv_image_has_fmask(iview->image)) {
+      va = radv_buffer_get_va(iview->image->bindings[0].bo) + iview->image->bindings[0].offset + surf->fmask_offset;
+      cb->cb_color_fmask = va >> 8;
+      cb->cb_color_fmask |= surf->fmask_tile_swizzle;
+   } else {
+      cb->cb_color_fmask = cb->cb_color_base;
    }
 
    ntype = ac_get_cb_number_type(desc->format);
@@ -1820,41 +1853,12 @@ radv_initialise_vrs_surface(struct radv_image *image, struct radv_buffer *htile_
 }
 
 void
-radv_initialise_ds_surface_va(const struct radv_device *device, struct radv_ds_buffer_info *ds,
-                              struct radv_image_view *iview)
-{
-   unsigned level = iview->vk.base_mip_level;
-   uint64_t va, s_offs, z_offs;
-   const struct radv_image_plane *plane = &iview->image->planes[0];
-   const struct radeon_surf *surf = &plane->surface;
-
-   assert(vk_format_get_plane_count(iview->image->vk.format) == 1);
-
-   va = radv_buffer_get_va(iview->image->bindings[0].bo) + iview->image->bindings[0].offset;
-   s_offs = z_offs = va;
-
-   if (device->physical_device->rad_info.gfx_level >= GFX9) {
-      assert(surf->u.gfx9.surf_offset == 0);
-      s_offs += surf->u.gfx9.zs.stencil_offset;
-   } else {
-      z_offs += (uint64_t)surf->u.legacy.level[level].offset_256B * 256;
-      s_offs += (uint64_t)surf->u.legacy.zs.stencil_level[level].offset_256B * 256;
-   }
-   if (radv_htile_enabled(iview->image, level)) {
-      va = radv_buffer_get_va(iview->image->bindings[0].bo) + iview->image->bindings[0].offset + surf->meta_offset;
-      ds->db_htile_data_base = va >> 8;
-   }
-
-   ds->db_z_read_base = ds->db_z_write_base = z_offs >> 8;
-   ds->db_stencil_read_base = ds->db_stencil_write_base = s_offs >> 8;
-}
-
-void
 radv_initialise_ds_surface(const struct radv_device *device, struct radv_ds_buffer_info *ds,
                            struct radv_image_view *iview)
 {
    unsigned level = iview->vk.base_mip_level;
    unsigned format, stencil_format;
+   uint64_t va, s_offs, z_offs;
    bool stencil_only = iview->image->vk.format == VK_FORMAT_S8_UINT;
    const struct radv_image_plane *plane = &iview->image->planes[0];
    const struct radeon_surf *surf = &plane->surface;
@@ -1876,12 +1880,16 @@ radv_initialise_ds_surface(const struct radv_device *device, struct radv_ds_buff
    ds->db_htile_data_base = 0;
    ds->db_htile_surface = 0;
 
+   va = radv_buffer_get_va(iview->image->bindings[0].bo) + iview->image->bindings[0].offset;
+   s_offs = z_offs = va;
+
    /* Recommended value for better performance with 4x and 8x. */
    ds->db_render_override2 = S_028010_DECOMPRESS_Z_ON_FLUSH(iview->image->vk.samples >= 4) |
                              S_028010_CENTROID_COMPUTATION_MODE(device->physical_device->rad_info.gfx_level >= GFX10_3);
 
    if (device->physical_device->rad_info.gfx_level >= GFX9) {
       assert(surf->u.gfx9.surf_offset == 0);
+      s_offs += surf->u.gfx9.zs.stencil_offset;
 
       ds->db_z_info = S_028038_FORMAT(format) | S_028038_NUM_SAMPLES(util_logbase2(iview->image->vk.samples)) |
                       S_028038_SW_MODE(surf->u.gfx9.swizzle_mode) | S_028038_MAXMIP(iview->image->vk.mip_levels - 1) |
@@ -1924,6 +1932,8 @@ radv_initialise_ds_surface(const struct radv_device *device, struct radv_ds_buff
             ds->db_stencil_info |= S_02803C_TILE_STENCIL_DISABLE(1);
          }
 
+         va = radv_buffer_get_va(iview->image->bindings[0].bo) + iview->image->bindings[0].offset + surf->meta_offset;
+         ds->db_htile_data_base = va >> 8;
          ds->db_htile_surface = S_028ABC_FULL_CACHE(1) | S_028ABC_PIPE_ALIGNED(1);
 
          if (device->physical_device->rad_info.gfx_level == GFX9) {
@@ -1943,6 +1953,9 @@ radv_initialise_ds_surface(const struct radv_device *device, struct radv_ds_buff
 
       if (stencil_only)
          level_info = &surf->u.legacy.zs.stencil_level[level];
+
+      z_offs += (uint64_t)surf->u.legacy.level[level].offset_256B * 256;
+      s_offs += (uint64_t)surf->u.legacy.zs.stencil_level[level].offset_256B * 256;
 
       ds->db_depth_info = S_02803C_ADDR5_SWIZZLE_MASK(!radv_image_is_tc_compat_htile(iview->image));
       ds->db_z_info = S_028040_FORMAT(format) | S_028040_ZRANGE_PRECISION(1);
@@ -1991,6 +2004,8 @@ radv_initialise_ds_surface(const struct radv_device *device, struct radv_ds_buff
             ds->db_stencil_info |= S_028044_TILE_STENCIL_DISABLE(1);
          }
 
+         va = radv_buffer_get_va(iview->image->bindings[0].bo) + iview->image->bindings[0].offset + surf->meta_offset;
+         ds->db_htile_data_base = va >> 8;
          ds->db_htile_surface = S_028ABC_FULL_CACHE(1);
 
          if (radv_image_is_tc_compat_htile(iview->image)) {
@@ -2001,6 +2016,9 @@ radv_initialise_ds_surface(const struct radv_device *device, struct radv_ds_buff
          }
       }
    }
+
+   ds->db_z_read_base = ds->db_z_write_base = z_offs >> 8;
+   ds->db_stencil_read_base = ds->db_stencil_write_base = s_offs >> 8;
 }
 
 void

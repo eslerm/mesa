@@ -66,6 +66,8 @@ struct blorp_context {
 
    const struct brw_compiler *compiler;
 
+   bool enable_tbimr;
+
    bool (*lookup_shader)(struct blorp_batch *batch,
                          const void *key, uint32_t key_size,
                          uint32_t *kernel_out, void *prog_data_out);
@@ -109,9 +111,6 @@ enum blorp_batch_flags {
 
    /** Use the hardware blitter to perform any operations in this batch */
    BLORP_BATCH_USE_BLITTER = (1 << 4),
-
-   /** Need a PSS Stall Sync, Wa_18019816803. */
-   BLORP_BATCH_NEED_PSS_STALL_SYNC = (1 << 5),
 };
 
 struct blorp_batch {

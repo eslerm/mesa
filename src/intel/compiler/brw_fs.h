@@ -183,6 +183,8 @@ struct brw_fs_bind_info {
    unsigned binding;
 };
 
+class fs_instruction_scheduler;
+
 /**
  * The fragment shader front-end.
  *
@@ -256,7 +258,13 @@ public:
                       unsigned *out_pull_index);
    bool lower_constant_loads();
    virtual void invalidate_analysis(brw::analysis_dependency_class c);
+
+#ifndef NDEBUG
    void validate();
+#else
+   void validate() {}
+#endif
+
    bool opt_algebraic();
    bool opt_redundant_halt();
    bool opt_cse();
@@ -273,7 +281,11 @@ public:
    bool remove_duplicate_mrf_writes();
    bool remove_extra_rounding_modes();
 
-   void schedule_instructions(instruction_scheduler_mode mode);
+   fs_instruction_scheduler *prepare_scheduler(void *mem_ctx);
+   void schedule_instructions_pre_ra(fs_instruction_scheduler *sched,
+                                     instruction_scheduler_mode mode);
+   void schedule_instructions_post_ra();
+
    void insert_gfx4_send_dependency_workarounds();
    void insert_gfx4_pre_send_dependency_workarounds(bblock_t *block,
                                                     fs_inst *inst);
@@ -297,7 +309,6 @@ public:
    bool lower_sub_sat();
    bool opt_combine_constants();
 
-   void emit_dummy_fs();
    void emit_repclear_shader();
    void emit_fragcoord_interpolation(fs_reg wpos);
    void emit_is_helper_invocation(fs_reg result);

@@ -6,15 +6,21 @@
 #ifndef __AGX_DEVICE_H
 #define __AGX_DEVICE_H
 
+#include "drm-uapi/asahi_drm.h"
 #include "util/simple_mtx.h"
 #include "util/sparse_array.h"
+#include "util/timespec.h"
 #include "util/vma.h"
 #include "agx_bo.h"
 #include "agx_formats.h"
 
+// TODO: this is a lie right now
+static const uint64_t AGX_SUPPORTED_INCOMPAT_FEATURES =
+   DRM_ASAHI_FEAT_MANDATORY_ZS_COMPRESSION;
+
 enum agx_dbg {
    AGX_DBG_TRACE = BITFIELD_BIT(0),
-   AGX_DBG_DEQP = BITFIELD_BIT(1),
+   AGX_DBG_NOCLIPCTRL = BITFIELD_BIT(1),
    AGX_DBG_NO16 = BITFIELD_BIT(2),
    AGX_DBG_DIRTY = BITFIELD_BIT(3),
    AGX_DBG_PRECOMPILE = BITFIELD_BIT(4),
@@ -30,26 +36,7 @@ enum agx_dbg {
    AGX_DBG_SMALLTILE = BITFIELD_BIT(14),
    AGX_DBG_NOMSAA = BITFIELD_BIT(15),
    AGX_DBG_NOSHADOW = BITFIELD_BIT(16),
-};
-
-/* Dummy partial declarations, pending real UAPI */
-enum drm_asahi_cmd_type { DRM_ASAHI_CMD_TYPE_PLACEHOLDER_FOR_DOWNSTREAM_UAPI };
-enum drm_asahi_sync_type { DRM_ASAHI_SYNC_SYNCOBJ };
-struct drm_asahi_sync {
-   uint32_t sync_type;
-   uint32_t handle;
-};
-struct drm_asahi_params_global {
-   uint64_t vm_page_size;
-   uint64_t vm_user_start;
-   uint64_t vm_user_end;
-   uint64_t vm_shader_start;
-   uint64_t vm_shader_end;
-   uint32_t chip_id;
-   uint32_t num_clusters_total;
-   uint32_t gpu_generation;
-   uint32_t gpu_variant;
-   uint32_t num_dies;
+   AGX_DBG_VARYINGS = BITFIELD_BIT(17),
 };
 
 /* How many power-of-two levels in the BO cache do we want? 2^14 minimum chosen
@@ -61,8 +48,17 @@ struct drm_asahi_params_global {
 /* Fencepost problem, hence the off-by-one */
 #define NR_BO_CACHE_BUCKETS (MAX_BO_CACHE_BUCKET - MIN_BO_CACHE_BUCKET + 1)
 
+/* Forward decl only, do not pull in all of NIR */
+struct nir_shader;
+
+#define BARRIER_RENDER  (1 << DRM_ASAHI_SUBQUEUE_RENDER)
+#define BARRIER_COMPUTE (1 << DRM_ASAHI_SUBQUEUE_COMPUTE)
+
 struct agx_device {
    uint32_t debug;
+
+   /* NIR library of AGX helpers/shaders. Immutable once created. */
+   const struct nir_shader *libagx;
 
    char name[64];
    struct drm_asahi_params_global params;
@@ -138,5 +134,18 @@ int agx_import_sync_file(struct agx_device *dev, struct agx_bo *bo, int fd);
 int agx_export_sync_file(struct agx_device *dev, struct agx_bo *bo);
 
 void agx_debug_fault(struct agx_device *dev, uint64_t addr);
+
+uint64_t agx_get_gpu_timestamp(struct agx_device *dev);
+
+static inline uint64_t
+agx_gpu_time_to_ns(struct agx_device *dev, uint64_t gpu_time)
+{
+   return (gpu_time * NSEC_PER_SEC) / dev->params.timer_frequency_hz;
+}
+
+void agx_bo_mmap(struct agx_bo *bo);
+
+void agx_get_device_uuid(const struct agx_device *dev, void *uuid);
+void agx_get_driver_uuid(void *uuid);
 
 #endif

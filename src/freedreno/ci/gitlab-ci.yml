@@ -91,7 +91,7 @@ a618_gl:
     HWCI_START_WESTON: 1
     DEQP_SUITE: freedreno-a618-egl
 
-.a618_skqp:  # FIXME disabled due to device outage
+a618_skqp:
   extends:
     - .lava-test-deqp:arm64
     - .a618-test-limozeen-nots-r5
@@ -155,7 +155,8 @@ a660_gl:
   variables:
     DEQP_SUITE: freedreno-a660
 
-a660_vk:
+# disabled due to 1.3.7.0 CTS uprev, we have already -full job running in nightly
+.a660_vk:
   extends:
     - .lava-test-deqp:arm64
     - .collabora-turnip-rules
@@ -167,7 +168,7 @@ a660_vk:
 
 a660_vk_full:
   extends:
-    - a660_vk
+    - .a660_vk
     - .collabora-turnip-manual-rules
   parallel: 3
   timeout: 3h
@@ -175,6 +176,7 @@ a660_vk_full:
     DEQP_SUITE: freedreno-a660-vk-full
     JOB_TIMEOUT: 180
 
+# X11 takes over the screen, wayland is run headless.
 a630_gl:
   extends:
     - .baremetal-deqp-test
@@ -182,18 +184,8 @@ a630_gl:
   parallel: 4
   variables:
     DEQP_SUITE: freedreno-a630
-
-# Run dEQP EGL window system tests separately with the window systems available.
-# X11 takes over the screen, wayland is run headless.
-a630_egl:
-  extends:
-    - .baremetal-deqp-test
-    - .a630-test
-  variables:
-    DEQP_VER: egl
     HWCI_START_XORG: 1
     HWCI_START_WESTON: 1
-    DEQP_SUITE: freedreno-a630-egl
 
 a630_gles_asan:
   extends:
@@ -206,16 +198,6 @@ a630_gles_asan:
     DEQP_EXPECTED_RENDERER: FD630
     FDO_CI_CONCURRENT: 2 # We get OOMkills if we go too wide with asan enabled
     GPU_VERSION: freedreno-a630-asan
-
-a630_skqp:
-  extends:
-    - .baremetal-deqp-test
-    - .a630-test
-    # SKQP tests both the GL and VK drivers.
-    - .google-freedreno-turnip-rules
-  variables:
-    HWCI_START_WESTON: 1
-    DEQP_SUITE: freedreno-a630-skqp
 
 a630_vk:
   extends:

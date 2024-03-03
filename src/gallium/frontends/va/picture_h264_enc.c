@@ -201,6 +201,10 @@ vlVaHandleVAEncSequenceParameterBufferTypeH264(vlVaDriver *drv, vlVaContext *con
       context->desc.h264enc.rate_ctrl[0].max_qp = 51;
       context->desc.h264enc.rate_ctrl[0].min_qp = 0;
       context->desc.h264enc.enable_vui = false;
+      context->desc.h264enc.intra_refresh.mode = INTRA_REFRESH_MODE_NONE;
+      context->desc.h264enc.intra_refresh.offset = 0;
+      context->desc.h264enc.intra_refresh.region_size = 0;
+      context->desc.h264enc.intra_refresh.need_sequence_header = 0;
    }
 
    context->desc.h264enc.intra_idr_period =
@@ -325,9 +329,28 @@ vlVaHandleVAEncMiscParameterTypeFrameRateH264(vlVaContext *context, VAEncMiscPar
    return VA_STATUS_SUCCESS;
 }
 
+static void parseEncHrdParamsH264(struct vl_rbsp *rbsp)
+{
+   unsigned i, cpb_cnt_minus1;
+
+   cpb_cnt_minus1 = vl_rbsp_ue(rbsp);
+   vl_rbsp_u(rbsp, 4); /* bit_rate_scale */
+   vl_rbsp_u(rbsp, 4); /* cpb_size_scale */
+   for (i = 0; i <= cpb_cnt_minus1; ++i) {
+      vl_rbsp_ue(rbsp); /* bit_rate_value_minus1[i] */
+      vl_rbsp_ue(rbsp); /* cpb_size_value_minus1[i] */
+      vl_rbsp_u(rbsp, 1); /* cbr_flag[i] */
+   }
+   vl_rbsp_u(rbsp, 5); /* initial_cpb_removal_delay_length_minus1 */
+   vl_rbsp_u(rbsp, 5); /* cpb_removal_delay_length_minus1 */
+   vl_rbsp_u(rbsp, 5); /* dpb_output_delay_length_minus1 */
+   vl_rbsp_u(rbsp, 5); /* time_offset_length */
+}
+
 static void parseEncSpsParamsH264(vlVaContext *context, struct vl_rbsp *rbsp)
 {
    unsigned i, profile_idc, num_ref_frames_in_pic_order_cnt_cycle;
+   unsigned nal_hrd_parameters_present_flag, vcl_hrd_parameters_present_flag;
 
    profile_idc = vl_rbsp_u(rbsp, 8);
 
@@ -412,6 +435,35 @@ static void parseEncSpsParamsH264(vlVaContext *context, struct vl_rbsp *rbsp)
          context->desc.h264enc.seq.chroma_sample_loc_type_top_field = vl_rbsp_ue(rbsp);
          context->desc.h264enc.seq.chroma_sample_loc_type_bottom_field = vl_rbsp_ue(rbsp);
       }
+
+      if (vl_rbsp_u(rbsp, 1)) { /* timing_info_present_flag */
+         vl_rbsp_u(rbsp, 32); /* num_units_in_tick */
+         vl_rbsp_u(rbsp, 32); /* time_scale */
+         vl_rbsp_u(rbsp, 1); /* fixed_frame_rate_flag */
+      }
+
+      nal_hrd_parameters_present_flag = vl_rbsp_u(rbsp, 1);
+      if (nal_hrd_parameters_present_flag)
+         parseEncHrdParamsH264(rbsp);
+
+      vcl_hrd_parameters_present_flag = vl_rbsp_u(rbsp, 1);
+      if (vcl_hrd_parameters_present_flag)
+         parseEncHrdParamsH264(rbsp);
+
+      if (nal_hrd_parameters_present_flag || vcl_hrd_parameters_present_flag)
+         vl_rbsp_u(rbsp, 1); /* low_delay_hrd_flag */
+
+      vl_rbsp_u(rbsp, 1); /* pic_struct_present_flag */
+
+      if (vl_rbsp_u(rbsp, 1)) { /* bitstream_restriction_flag */
+         vl_rbsp_u(rbsp, 1); /* motion_vectors_over_pic_boundaries_flag */
+         vl_rbsp_ue(rbsp); /* max_bytes_per_pic_denom */
+         vl_rbsp_ue(rbsp); /* max_bits_per_mb_denom */
+         vl_rbsp_ue(rbsp); /* log2_max_mv_length_horizontal */
+         vl_rbsp_ue(rbsp); /* log2_max_mv_length_vertical */
+         context->desc.h264enc.seq.max_num_reorder_frames = vl_rbsp_ue(rbsp);
+         vl_rbsp_ue(rbsp); /* max_dec_frame_buffering */
+      }
    }
 }
 
@@ -438,7 +490,7 @@ vlVaHandleVAEncPackedHeaderDataBufferTypeH264(vlVaContext *context, vlVaBuffer *
       unsigned nal_unit_type = vl_vlc_get_uimsbf(&vlc, 5);
 
       struct vl_rbsp rbsp;
-      vl_rbsp_init(&rbsp, &vlc, ~0);
+      vl_rbsp_init(&rbsp, &vlc, ~0, context->packed_header_emulation_bytes);
 
       switch(nal_unit_type) {
       case H264_NAL_SPS:
@@ -448,6 +500,9 @@ vlVaHandleVAEncPackedHeaderDataBufferTypeH264(vlVaContext *context, vlVaBuffer *
       default:
          break;
       }
+
+      if (!context->packed_header_emulation_bytes)
+         break;
    }
 
    return VA_STATUS_SUCCESS;

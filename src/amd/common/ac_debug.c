@@ -117,6 +117,10 @@ static const struct si_reg *find_register(enum amd_gfx_level gfx_level, enum rad
    unsigned table_size;
 
    switch (gfx_level) {
+   case GFX11_5:
+      table = gfx115_reg_table;
+      table_size = ARRAY_SIZE(gfx115_reg_table);
+      break;
    case GFX11:
       table = gfx11_reg_table;
       table_size = ARRAY_SIZE(gfx11_reg_table);
@@ -1133,16 +1137,18 @@ static int compare_wave(const void *p1, const void *p2)
 }
 
 /* Return wave information. "waves" should be a large enough array. */
-unsigned ac_get_wave_info(enum amd_gfx_level gfx_level,
+unsigned ac_get_wave_info(enum amd_gfx_level gfx_level, const struct radeon_info *info,
                           struct ac_wave_info waves[AC_MAX_WAVES_PER_CHIP])
 {
 #ifdef _WIN32
    return 0;
 #else
-   char line[2000], cmd[128];
+   char line[2000], cmd[256];
    unsigned num_waves = 0;
 
-   sprintf(cmd, "umr -O halt_waves -wa %s", gfx_level >= GFX10 ? "gfx_0.0.0" : "gfx");
+   sprintf(cmd, "umr --by-pci %04x:%02x:%02x.%01x -O halt_waves -wa %s",
+           info->pci.domain, info->pci.bus, info->pci.dev, info->pci.func,
+           gfx_level >= GFX10 ? "gfx_0.0.0" : "gfx");
 
    FILE *p = popen(cmd, "r");
    if (!p)
@@ -1175,4 +1181,52 @@ unsigned ac_get_wave_info(enum amd_gfx_level gfx_level,
    pclose(p);
    return num_waves;
 #endif
+}
+
+/* List of GFXHUB clients from AMDGPU source code. */
+static const char *const gfx10_gfxhub_client_ids[] = {
+   "CB/DB",
+   "Reserved",
+   "GE1",
+   "GE2",
+   "CPF",
+   "CPC",
+   "CPG",
+   "RLC",
+   "TCP",
+   "SQC (inst)",
+   "SQC (data)",
+   "SQG",
+   "Reserved",
+   "SDMA0",
+   "SDMA1",
+   "GCR",
+   "SDMA2",
+   "SDMA3",
+};
+
+static const char *
+ac_get_gfx10_gfxhub_client(unsigned cid)
+{
+   if (cid >= ARRAY_SIZE(gfx10_gfxhub_client_ids))
+      return "UNKNOWN";
+   return gfx10_gfxhub_client_ids[cid];
+}
+
+void ac_print_gpuvm_fault_status(FILE *output, enum amd_gfx_level gfx_level,
+                                 uint32_t status)
+{
+   if (gfx_level >= GFX10) {
+      const uint8_t cid = G_00A130_CID(status);
+
+      fprintf(output, "GCVM_L2_PROTECTION_FAULT_STATUS: 0x%x\n", status);
+      fprintf(output, "\t CLIENT_ID: (%s) 0x%x\n", ac_get_gfx10_gfxhub_client(cid), cid);
+      fprintf(output, "\t MORE_FAULTS: %d\n", G_00A130_MORE_FAULTS(status));
+      fprintf(output, "\t WALKER_ERROR: %d\n", G_00A130_WALKER_ERROR(status));
+      fprintf(output, "\t PERMISSION_FAULTS: %d\n", G_00A130_PERMISSION_FAULTS(status));
+      fprintf(output, "\t MAPPING_ERROR: %d\n", G_00A130_MAPPING_ERROR(status));
+      fprintf(output, "\t RW: %d\n", G_00A130_RW(status));
+   } else {
+      fprintf(output, "VM_CONTEXT1_PROTECTION_FAULT_STATUS: 0x%x\n", status);
+   }
 }

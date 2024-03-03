@@ -214,6 +214,11 @@ radv_generate_pipeline_key(const struct radv_device *device, const VkPipelineSha
          key.vertex_robustness1 = 1u;
    }
 
+   for (uint32_t i = 0; i < num_stages; i++) {
+      if (stages[i].stage == VK_SHADER_STAGE_MESH_BIT_EXT && device->mesh_fast_launch_2)
+         key.mesh_fast_launch_2 = 1u;
+   }
+
    return key;
 }
 
@@ -242,8 +247,6 @@ radv_get_hash_flags(const struct radv_device *device, bool stats)
       hash_flags |= RADV_HASH_SHADER_SPLIT_FMA;
    if (device->instance->debug_flags & RADV_DEBUG_NO_FMASK)
       hash_flags |= RADV_HASH_SHADER_NO_FMASK;
-   if (device->physical_device->use_ngg_streamout)
-      hash_flags |= RADV_HASH_SHADER_NGG_STREAMOUT;
    if (device->instance->debug_flags & RADV_DEBUG_NO_RT)
       hash_flags |= RADV_HASH_SHADER_NO_RT;
    if (device->instance->dual_color_blend_by_location)
@@ -485,6 +488,11 @@ opt_vectorize_callback(const nir_instr *instr, const void *_)
       return 1;
 
    switch (alu->op) {
+   case nir_op_f2f16: {
+      nir_shader *shader = nir_cf_node_get_function(&instr->block->cf_node)->function->shader;
+      unsigned execution_mode = shader->info.float_controls_execution_mode;
+      return nir_is_rounding_mode_rtz(execution_mode, 16) ? 2 : 1;
+   }
    case nir_op_fadd:
    case nir_op_fsub:
    case nir_op_fmul:
@@ -496,6 +504,7 @@ opt_vectorize_callback(const nir_instr *instr, const void *_)
    case nir_op_fsat:
    case nir_op_fmin:
    case nir_op_fmax:
+   case nir_op_f2f16_rtz:
    case nir_op_iabs:
    case nir_op_iadd:
    case nir_op_iadd_sat:
@@ -725,6 +734,8 @@ radv_postprocess_nir(struct radv_device *device, const struct radv_pipeline_key 
               device->physical_device->rad_info.address32_hi);
    radv_optimize_nir_algebraic(
       stage->nir, io_to_mem || lowered_ngg || stage->stage == MESA_SHADER_COMPUTE || stage->stage == MESA_SHADER_TASK);
+
+   NIR_PASS(_, stage->nir, nir_lower_fp16_casts, nir_lower_fp16_split_fp64);
 
    if (stage->nir->info.bit_sizes_int & (8 | 16)) {
       if (gfx_level >= GFX8) {
@@ -1178,7 +1189,8 @@ radv_copy_shader_stage_create_info(struct radv_device *device, uint32_t stageCou
    if (!new_stages)
       return NULL;
 
-   memcpy(new_stages, pStages, size);
+   if (size)
+      memcpy(new_stages, pStages, size);
 
    for (uint32_t i = 0; i < stageCount; i++) {
       RADV_FROM_HANDLE(vk_shader_module, module, new_stages[i].module);

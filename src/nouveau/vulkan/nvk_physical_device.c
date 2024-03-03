@@ -4,6 +4,7 @@
  */
 #include "nvk_physical_device.h"
 
+#include "nak.h"
 #include "nvk_buffer.h"
 #include "nvk_entrypoints.h"
 #include "nvk_format.h"
@@ -40,13 +41,6 @@
 #include "clc5c0.h"
 #include "clc997.h"
 
-PUBLIC VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
-vk_icdGetPhysicalDeviceProcAddr(VkInstance _instance, const char *pName)
-{
-   VK_FROM_HANDLE(nvk_instance, instance, _instance);
-   return vk_instance_get_physical_device_proc_addr(&instance->vk, pName);
-}
-
 static void
 nvk_get_device_extensions(const struct nv_device_info *info,
                           struct vk_device_extension_table *ext)
@@ -79,6 +73,7 @@ nvk_get_device_extensions(const struct nv_device_info *info,
       .KHR_maintenance4 = true,
       .KHR_map_memory2 = true,
       .KHR_multiview = true,
+      .KHR_pipeline_executable_properties = true,
       .KHR_push_descriptor = true,
       .KHR_relaxed_block_layout = true,
       .KHR_sampler_mirror_clamp_to_edge = true,
@@ -87,6 +82,8 @@ nvk_get_device_extensions(const struct nv_device_info *info,
       .KHR_shader_clock = true,
       .KHR_shader_draw_parameters = true,
       .KHR_shader_non_semantic_info = true,
+      .KHR_shader_terminate_invocation =
+         (nvk_nak_stages(info) & VK_SHADER_STAGE_FRAGMENT_BIT) != 0,
       .KHR_spirv_1_4 = true,
       .KHR_storage_buffer_storage_class = true,
       .KHR_timeline_semaphore = true,
@@ -94,10 +91,12 @@ nvk_get_device_extensions(const struct nv_device_info *info,
       .KHR_swapchain = true,
       .KHR_swapchain_mutable_format = true,
 #endif
+      .KHR_synchronization2 = true,
       .KHR_uniform_buffer_standard_layout = true,
       .KHR_variable_pointers = true,
       .KHR_workgroup_memory_explicit_layout = true,
       .EXT_4444_formats = true,
+      .EXT_attachment_feedback_loop_layout = true,
       .EXT_border_color_swizzle = true,
       .EXT_buffer_device_address = true,
       .EXT_conditional_rendering = true,
@@ -106,6 +105,7 @@ nvk_get_device_extensions(const struct nv_device_info *info,
       .EXT_depth_clip_control = true,
       .EXT_depth_clip_enable = true,
       .EXT_descriptor_indexing = true,
+      .EXT_dynamic_rendering_unused_attachments = true,
       .EXT_extended_dynamic_state = true,
       .EXT_extended_dynamic_state2 = true,
       .EXT_extended_dynamic_state3 = true,
@@ -209,6 +209,8 @@ nvk_get_device_features(const struct nv_device_info *info,
 
       /* Vulkan 1.2 */
       .samplerMirrorClampToEdge = true,
+      .descriptorIndexing = true,
+      .drawIndirectCount = info->cls_eng3d >= TURING_A,
       .shaderInputAttachmentArrayDynamicIndexing = true,
       .shaderUniformTexelBufferArrayDynamicIndexing = true,
       .shaderStorageTexelBufferArrayDynamicIndexing = true,
@@ -229,18 +231,17 @@ nvk_get_device_features(const struct nv_device_info *info,
       .descriptorBindingPartiallyBound = true,
       .descriptorBindingVariableDescriptorCount = true,
       .runtimeDescriptorArray = true,
+      .samplerFilterMinmax = info->cls_eng3d >= MAXWELL_B,
       .imagelessFramebuffer = true,
       .uniformBufferStandardLayout = true,
       .separateDepthStencilLayouts = true,
       .hostQueryReset = true,
       .timelineSemaphore = true,
       .bufferDeviceAddress = true,
-      .bufferDeviceAddressCaptureReplay = false,
+      .bufferDeviceAddressCaptureReplay = true,
       .bufferDeviceAddressMultiDevice = false,
-      .drawIndirectCount = info->cls_eng3d >= TURING_A,
-      .samplerFilterMinmax = info->cls_eng3d >= MAXWELL_B,
-      .conditionalRendering = true,
-      .inheritedConditionalRendering = true,
+      .shaderOutputViewportIndex = info->cls_eng3d >= MAXWELL_B,
+      .shaderOutputLayer = info->cls_eng3d >= MAXWELL_B,
 
       /* Vulkan 1.3 */
       .robustImageAccess = true,
@@ -248,8 +249,13 @@ nvk_get_device_features(const struct nv_device_info *info,
       .descriptorBindingInlineUniformBlockUpdateAfterBind = true,
       .privateData = true,
       .shaderDemoteToHelperInvocation = true,
+      .shaderTerminateInvocation = true,
+      .synchronization2 = true,
       .dynamicRendering = true,
       .maintenance4 = true,
+
+      /* VK_KHR_pipeline_executable_properties */
+      .pipelineExecutableInfo = true,
 
       /* VK_KHR_shader_clock */
       .shaderSubgroupClock = true,
@@ -265,12 +271,19 @@ nvk_get_device_features(const struct nv_device_info *info,
       .formatA4R4G4B4 = true,
       .formatA4B4G4R4 = true,
 
+      /* VK_EXT_attachment_feedback_loop_layout */
+      .attachmentFeedbackLoopLayout = true,
+
       /* VK_EXT_border_color_swizzle */
       .borderColorSwizzle = true,
       .borderColorSwizzleFromImage = false,
 
       /* VK_EXT_buffer_device_address */
-      .bufferDeviceAddressCaptureReplayEXT = false,
+      .bufferDeviceAddressCaptureReplayEXT = true,
+
+      /* VK_EXT_conditional_rendering */
+      .conditionalRendering = true,
+      .inheritedConditionalRendering = true,
 
       /* VK_EXT_custom_border_color */
       .customBorderColors = true,
@@ -287,6 +300,9 @@ nvk_get_device_features(const struct nv_device_info *info,
 
       /* VK_EXT_depth_clip_enable */
       .depthClipEnable = true,
+
+      /* VK_EXT_dynamic_rendering_unused_attachments */
+      .dynamicRenderingUnusedAttachments = true,
 
       /* VK_EXT_extended_dynamic_state */
       .extendedDynamicState = true,
@@ -524,6 +540,12 @@ nvk_get_device_properties(const struct nvk_instance *instance,
       .sparseResidencyNonResidentStrict = true,
 
       /* Vulkan 1.1 properties */
+      .subgroupSize = 32,
+      .subgroupSupportedStages = nvk_nak_stages(info),
+      .subgroupSupportedOperations = VK_SUBGROUP_FEATURE_BALLOT_BIT |
+                                     VK_SUBGROUP_FEATURE_BASIC_BIT |
+                                     VK_SUBGROUP_FEATURE_VOTE_BIT,
+      .subgroupQuadOperationsInAllStages = false,
       .pointClippingBehavior = VK_POINT_CLIPPING_BEHAVIOR_USER_CLIP_PLANES_ONLY,
       .maxMultiviewViewCount = NVK_MAX_MULTIVIEW_VIEW_COUNT,
       .maxMultiviewInstanceIndex = UINT32_MAX,
@@ -827,6 +849,12 @@ nvk_create_drm_physical_device(struct vk_instance *_instance,
    pdev->render_dev = render_dev;
    pdev->info = info;
 
+   pdev->nak = nak_compiler_create(&pdev->info);
+   if (pdev->nak == NULL) {
+      result = vk_error(instance, VK_ERROR_OUT_OF_HOST_MEMORY);
+      goto fail_init;
+   }
+
    nvk_physical_device_init_pipeline_cache(pdev);
 
    pdev->mem_heaps[0].flags = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
@@ -876,6 +904,8 @@ nvk_create_drm_physical_device(struct vk_instance *_instance,
 
 fail_disk_cache:
    nvk_physical_device_free_disk_cache(pdev);
+   nak_compiler_destroy(pdev->nak);
+fail_init:
    vk_physical_device_finish(&pdev->vk);
 fail_alloc:
    vk_free(&instance->vk.alloc, pdev);
@@ -890,6 +920,7 @@ nvk_physical_device_destroy(struct vk_physical_device *vk_pdev)
 
    nvk_finish_wsi(pdev);
    nvk_physical_device_free_disk_cache(pdev);
+   nak_compiler_destroy(pdev->nak);
    vk_physical_device_finish(&pdev->vk);
    vk_free(&pdev->vk.instance->alloc, pdev);
 }

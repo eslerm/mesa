@@ -1176,14 +1176,10 @@ static void radeon_enc_feedback(struct radeon_encoder *enc)
 
 static void radeon_enc_intra_refresh(struct radeon_encoder *enc)
 {
-   enc->enc_pic.intra_ref.intra_refresh_mode = RENCODE_INTRA_REFRESH_MODE_NONE;
-   enc->enc_pic.intra_ref.offset = 0;
-   enc->enc_pic.intra_ref.region_size = 0;
-
    RADEON_ENC_BEGIN(enc->cmd.intra_refresh);
-   RADEON_ENC_CS(enc->enc_pic.intra_ref.intra_refresh_mode);
-   RADEON_ENC_CS(enc->enc_pic.intra_ref.offset);
-   RADEON_ENC_CS(enc->enc_pic.intra_ref.region_size);
+   RADEON_ENC_CS(enc->enc_pic.intra_refresh.intra_refresh_mode);
+   RADEON_ENC_CS(enc->enc_pic.intra_refresh.offset);
+   RADEON_ENC_CS(enc->enc_pic.intra_refresh.region_size);
    RADEON_ENC_END();
 }
 
@@ -1354,7 +1350,7 @@ static void radeon_enc_headers_h264(struct radeon_encoder *enc)
    enc->nalu_aud(enc);
    if (enc->enc_pic.layer_ctrl.num_temporal_layers > 1)
       enc->nalu_prefix(enc);
-   if (enc->enc_pic.is_idr) {
+   if (enc->enc_pic.is_idr || enc->enc_pic.need_sequence_header) {
       if (enc->enc_pic.layer_ctrl.num_temporal_layers > 1)
          enc->nalu_sei(enc);
       enc->nalu_sps(enc);
@@ -1368,7 +1364,7 @@ static void radeon_enc_headers_h264(struct radeon_encoder *enc)
 static void radeon_enc_headers_hevc(struct radeon_encoder *enc)
 {
    enc->nalu_aud(enc);
-   if (enc->enc_pic.is_idr) {
+   if (enc->enc_pic.is_idr || enc->enc_pic.need_sequence_header) {
       enc->nalu_vps(enc);
       enc->nalu_pps(enc);
       enc->nalu_sps(enc);
@@ -1476,6 +1472,27 @@ static void manage_dpb_before_encode(struct radeon_encoder *enc)
    assert(current_pic_idx >= 0);
 
    int ref0_idx = find_ref_idx(enc, enc->enc_pic.ref_idx_l0, enc->enc_pic.ref_idx_l0_is_ltr);
+   /* B-frames only supported on VCN >= 3.0 */
+   int ref1_idx = find_ref_idx(enc, enc->enc_pic.ref_idx_l1, enc->enc_pic.ref_idx_l1_is_ltr);
+
+   assert(enc->enc_pic.picture_type != PIPE_H2645_ENC_PICTURE_TYPE_P ||
+          ref0_idx != -1);
+   assert(enc->enc_pic.picture_type != PIPE_H2645_ENC_PICTURE_TYPE_B ||
+          (ref0_idx != -1 && ref1_idx != -1));
+
+   /* In case we didn't find the reference in dpb, we have to pick
+    * some valid index to prevent GPU hang. */
+   if ((enc->enc_pic.picture_type == PIPE_H2645_ENC_PICTURE_TYPE_P ||
+        enc->enc_pic.picture_type == PIPE_H2645_ENC_PICTURE_TYPE_B) &&
+       ref0_idx == -1) {
+      RVID_ERR("Failed to find ref0 (%u).\n", enc->enc_pic.ref_idx_l0);
+      ref0_idx = (current_pic_idx + 1) % (enc->base.max_references + 1);
+   }
+
+   if (enc->enc_pic.picture_type == PIPE_H2645_ENC_PICTURE_TYPE_B && ref1_idx == -1) {
+      RVID_ERR("Failed to find ref1 (%u).\n", enc->enc_pic.ref_idx_l1);
+      ref1_idx = (current_pic_idx + 2) % (enc->base.max_references + 1);
+   }
 
    if (!enc->enc_pic.not_referenced)
       enc->dpb_info[current_pic_idx].in_use = true;
@@ -1488,11 +1505,15 @@ static void manage_dpb_before_encode(struct radeon_encoder *enc)
       enc->dpb_info[current_pic_idx].is_ltr = false;
    }
 
-   if (enc->enc_pic.picture_type == PIPE_H2645_ENC_PICTURE_TYPE_IDR)
+   if (enc->enc_pic.picture_type == PIPE_H2645_ENC_PICTURE_TYPE_IDR) {
       enc->enc_pic.enc_params.reference_picture_index = 0xFFFFFFFF;
-   else
+      enc->enc_pic.h264_enc_params.l1_reference_picture0_index = 0xFFFFFFFF;
+   } else {
       enc->enc_pic.enc_params.reference_picture_index = ref0_idx;
+      enc->enc_pic.h264_enc_params.l1_reference_picture0_index = ref1_idx;
+   }
    enc->enc_pic.enc_params.reconstructed_picture_index = current_pic_idx;
+   enc->enc_pic.h264_enc_params.is_reference = !enc->enc_pic.not_referenced;
 }
 
 void radeon_enc_1_2_init(struct radeon_encoder *enc)

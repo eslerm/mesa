@@ -26,6 +26,7 @@
 
 
 #include "u_inlines.h"
+#include "compiler/shader_enums.h"
 #include "util/u_memory.h"
 #include "u_prim_restart.h"
 #include "u_prim.h"
@@ -151,53 +152,101 @@ util_prim_restart_convert_to_direct(const void *index_map,
                                     unsigned *max_index,
                                     unsigned *total_index_count)
 {
-   struct range_info ranges = { .min_index = UINT32_MAX, 0 };
-   unsigned i, start, count;
-   ranges.min_index = UINT32_MAX;
+   unsigned i, count;
 
    assert(info->index_size);
    assert(info->primitive_restart);
 
+   enum mesa_prim prim = info->mode;
+   unsigned verts_per_prim = mesa_vertices_per_prim(prim);
+
+   void *out_index_map = calloc(info->index_size, draw->count * 6);
+   count = 0;
+
 #define SCAN_INDEXES(TYPE) \
-   for (i = 0; i <= draw->count; i++) { \
-      if (i == draw->count || \
-          ((const TYPE *) index_map)[i] == info->restart_index) { \
-         /* cut / restart */ \
-         if (count > 0) { \
-            if (!add_range(info->mode, &ranges, draw->start + start, count, draw->index_bias)) { \
-               return NULL; \
-            } \
+   TYPE buf[6]; \
+   TYPE *map = out_index_map; \
+   const TYPE *in_map = index_map; \
+   unsigned prim_begin = 0; \
+   unsigned buf_size = 0; \
+   for (i = 0; i < draw->count; i++) { \
+      buf[buf_size++] = in_map[i]; \
+      \
+      if (in_map[i] == info->restart_index) { \
+         if (prim == MESA_PRIM_LINE_LOOP && buf_size == 2) { \
+            map[count++] = buf[0]; \
+            map[count++] = in_map[prim_begin]; \
          } \
-         start = i + 1; \
-         count = 0; \
+         \
+         prim_begin = i + 1; \
+         buf_size = 0; \
+         continue; \
       } \
-      else { \
-         count++; \
+      \
+      if (buf_size == verts_per_prim) { \
+         /* Generate new unrolled primitive */ \
+         for (int j = 0; j < verts_per_prim; ++j) { \
+            map[count++] = buf[j]; \
+         } \
+         \
+         switch (prim) { \
+         case MESA_PRIM_POINTS: \
+         case MESA_PRIM_LINES: \
+         case MESA_PRIM_TRIANGLES: \
+         case MESA_PRIM_TRIANGLES_ADJACENCY: \
+         case MESA_PRIM_LINES_ADJACENCY: { \
+            /* reset lists */ \
+            buf_size = 0; \
+            break; \
+         } \
+         case MESA_PRIM_TRIANGLE_FAN: { \
+            /* fans keep vertex #0 */ \
+            buf_size = 1; \
+            break; \
+         } \
+         case MESA_PRIM_LINE_LOOP: \
+         case MESA_PRIM_LINE_STRIP: \
+         case MESA_PRIM_TRIANGLE_STRIP: { \
+            /* strips cycle */ \
+            for (int j = 1; j < verts_per_prim; ++j) { \
+               buf[j - 1] = buf[j]; \
+            } \
+            buf_size--; \
+            break; \
+         } \
+         default: \
+            unreachable("todo"); \
+         } \
       } \
+   } \
+   if (prim == MESA_PRIM_LINE_LOOP && buf_size == 1) { \
+      map[count++] = buf[0]; \
+      map[count++] = in_map[prim_begin]; \
    }
 
-   start = 0;
-   count = 0;
    switch (info->index_size) {
-   case 1:
+   case 1: {
       SCAN_INDEXES(uint8_t);
       break;
-   case 2:
+   }
+   case 2: {
       SCAN_INDEXES(uint16_t);
       break;
-   case 4:
+   }
+   case 4: {
       SCAN_INDEXES(uint32_t);
       break;
+   }
    default:
       assert(!"Bad index size");
       return NULL;
    }
 
-   *num_draws = ranges.count;
-   *min_index = ranges.min_index;
-   *max_index = ranges.max_index;
-   *total_index_count = ranges.total_index_count;
-   return ranges.draws;
+   *num_draws = 1;
+   *min_index = 0;
+   *max_index = UINT32_MAX;
+   *total_index_count = count;
+   return out_index_map;
 }
 
 /**
@@ -218,7 +267,6 @@ util_draw_vbo_without_prim_restart(struct pipe_context *context,
    struct pipe_draw_start_count_bias new_draw = *draw;
    struct pipe_transfer *src_transfer = NULL;
    DrawElementsIndirectCommand indirect;
-   struct pipe_draw_start_count_bias *direct_draws;
    unsigned num_draws = 0;
 
    assert(info->index_size);
@@ -263,7 +311,7 @@ util_draw_vbo_without_prim_restart(struct pipe_context *context,
    }
 
    unsigned total_index_count;
-   direct_draws = util_prim_restart_convert_to_direct(src_map, &new_info, &new_draw, &num_draws,
+   new_info.index.user = util_prim_restart_convert_to_direct(src_map, &new_info, &new_draw, &num_draws,
                                                       &new_info.min_index, &new_info.max_index,
                                                       &total_index_count);
    /* unmap index buffer */
@@ -271,10 +319,18 @@ util_draw_vbo_without_prim_restart(struct pipe_context *context,
       pipe_buffer_unmap(context, src_transfer);
 
    new_info.primitive_restart = false;
-   new_info.index_bounds_valid = true;
-   if (direct_draws)
-      context->draw_vbo(context, &new_info, drawid_offset, NULL, direct_draws, num_draws);
-   free(direct_draws);
+   new_info.index_bounds_valid = false;
+   new_info.mode = u_decomposed_prim(info->mode);
+   new_info.has_user_indices = true;
 
-   return num_draws > 0 ? PIPE_OK : PIPE_ERROR_OUT_OF_MEMORY;
+   struct pipe_draw_start_count_bias direct_draw = {
+      .start = 0,
+      .index_bias = draw->index_bias,
+      .count = total_index_count
+   };
+
+   context->draw_vbo(context, &new_info, drawid_offset, NULL, &direct_draw, 1);
+   free((void*)new_info.index.user);
+
+   return PIPE_OK;
 }

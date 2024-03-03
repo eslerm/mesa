@@ -14,19 +14,12 @@
 #include <sys/mman.h>
 #include <agx_pack.h>
 
+#include "drm-uapi/asahi_drm.h"
 #include "util/u_hexdump.h"
 #include "decode.h"
 #ifdef __APPLE__
 #include "agx_iokit.h"
 #endif
-
-/* Pending UAPI */
-struct drm_asahi_params_global {
-   int gpu_generation;
-   int gpu_variant;
-   int chip_id;
-   int num_clusters_total;
-};
 
 struct libagxdecode_config lib_config;
 
@@ -74,12 +67,14 @@ agxdecode_find_mapped_gpu_mem_containing(uint64_t addr)
       assert(ro_mapping_count < MAX_MAPPINGS);
    }
 
+#if __APPLE__
    if (mem && !mem->mapped) {
       fprintf(stderr,
               "[ERROR] access to memory not mapped (GPU %" PRIx64
               ", handle %u)\n",
               mem->ptr.gpu, mem->handle);
    }
+#endif
 
    return mem;
 }
@@ -275,6 +270,11 @@ agxdecode_map_read_write(void)
    {                                                                           \
       agx_unpack(agxdecode_dump_stream, cl, T, temp);                          \
       DUMP_UNPACKED(T, temp, str "\n");                                        \
+   }
+
+#define DUMP_FIELD(struct, fmt, field)                                         \
+   {                                                                           \
+      fprintf(agxdecode_dump_stream, #field " = " fmt "\n", struct->field);    \
    }
 
 #define agxdecode_log(str) fputs(str, agxdecode_dump_stream)
@@ -570,8 +570,8 @@ agxdecode_cdm(const uint8_t *map, uint64_t *link, bool verbose,
    enum agx_cdm_block_type block_type = (map[3] >> 5);
 
    switch (block_type) {
-   case AGX_CDM_BLOCK_TYPE_HEADER: {
-      size_t length = AGX_CDM_HEADER_LENGTH;
+   case AGX_CDM_BLOCK_TYPE_LAUNCH: {
+      size_t length = AGX_CDM_LAUNCH_LENGTH;
 
 #define CDM_PRINT(STRUCT_NAME, human)                                          \
    do {                                                                        \
@@ -580,11 +580,11 @@ agxdecode_cdm(const uint8_t *map, uint64_t *link, bool verbose,
       length += AGX_CDM_##STRUCT_NAME##_LENGTH;                                \
    } while (0);
 
-      agx_unpack(agxdecode_dump_stream, map, CDM_HEADER, hdr);
+      agx_unpack(agxdecode_dump_stream, map, CDM_LAUNCH, hdr);
       agxdecode_stateful(hdr.pipeline, "Pipeline", agxdecode_usc, verbose,
                          params, &hdr.sampler_state_register_count);
-      DUMP_UNPACKED(CDM_HEADER, hdr, "Compute\n");
-      map += AGX_CDM_HEADER_LENGTH;
+      DUMP_UNPACKED(CDM_LAUNCH, hdr, "Compute\n");
+      map += AGX_CDM_LAUNCH_LENGTH;
 
       /* Added in G14X */
       if (params->gpu_generation >= 14 && params->num_clusters_total > 1)
@@ -622,9 +622,9 @@ agxdecode_cdm(const uint8_t *map, uint64_t *link, bool verbose,
       return STATE_DONE;
    }
 
-   case AGX_CDM_BLOCK_TYPE_LAUNCH: {
-      DUMP_CL(CDM_LAUNCH, map, "Launch");
-      return AGX_CDM_LAUNCH_LENGTH;
+   case AGX_CDM_BLOCK_TYPE_BARRIER: {
+      DUMP_CL(CDM_BARRIER, map, "Barrier");
+      return AGX_CDM_BARRIER_LENGTH;
    }
 
    default:
@@ -705,10 +705,12 @@ agxdecode_vdm(const uint8_t *map, uint64_t *link, bool verbose,
       VDM_PRINT(vertex_shader_word_1, VERTEX_SHADER_WORD_1,
                 "Vertex shader word 1");
       VDM_PRINT(vertex_outputs, VERTEX_OUTPUTS, "Vertex outputs");
+      VDM_PRINT(tessellation, TESSELLATION, "Tessellation");
       VDM_PRINT(vertex_unknown, VERTEX_UNKNOWN, "Vertex unknown");
+      VDM_PRINT(tessellation_scale, TESSELLATION_SCALE, "Tessellation scale");
 
 #undef VDM_PRINT
-      return ALIGN_POT(length, 8);
+      return hdr.tessellation_scale_present ? length : ALIGN_POT(length, 8);
    }
 
    case AGX_VDM_BLOCK_TYPE_INDEX_LIST: {
@@ -745,6 +747,32 @@ agxdecode_vdm(const uint8_t *map, uint64_t *link, bool verbose,
    case AGX_VDM_BLOCK_TYPE_STREAM_TERMINATE: {
       DUMP_CL(VDM_STREAM_TERMINATE, map, "Stream Terminate");
       return STATE_DONE;
+   }
+
+   case AGX_VDM_BLOCK_TYPE_TESSELLATE: {
+      size_t length = AGX_VDM_TESSELLATE_LENGTH;
+      agx_unpack(agxdecode_dump_stream, map, VDM_TESSELLATE, hdr);
+      DUMP_UNPACKED(VDM_TESSELLATE, hdr, "Tessellate List\n");
+      map += AGX_VDM_TESSELLATE_LENGTH;
+
+#define TESS_PRINT(header_name, STRUCT_NAME, human)                            \
+   if (hdr.header_name##_present) {                                            \
+      DUMP_CL(VDM_TESSELLATE_##STRUCT_NAME, map, human);                       \
+      map += AGX_VDM_TESSELLATE_##STRUCT_NAME##_LENGTH;                        \
+      length += AGX_VDM_TESSELLATE_##STRUCT_NAME##_LENGTH;                     \
+   }
+
+      TESS_PRINT(factor_buffer, FACTOR_BUFFER, "Factor buffer");
+      TESS_PRINT(patch_count, PATCH_COUNT, "Patch");
+      TESS_PRINT(instance_count, INSTANCE_COUNT, "Instance count");
+      TESS_PRINT(base_patch, BASE_PATCH, "Base patch");
+      TESS_PRINT(base_instance, BASE_INSTANCE, "Base instance");
+      TESS_PRINT(instance_stride, INSTANCE_STRIDE, "Instance stride");
+      TESS_PRINT(indirect, INDIRECT, "Indirect");
+      TESS_PRINT(unknown, UNKNOWN, "Unknown");
+
+#undef TESS_PRINT
+      return length;
    }
 
    default:
@@ -802,6 +830,102 @@ agxdecode_gfx(uint32_t *cmdbuf, uint64_t encoder, bool verbose,
       agxdecode_stateful(gfx.partial_store_pipeline, "Partial store pipeline",
                          agxdecode_usc, verbose, params, NULL);
    }
+}
+
+static void
+agxdecode_sampler_heap(uint64_t heap, unsigned count)
+{
+   if (!heap)
+      return;
+
+   struct agx_sampler_packed samp[1024];
+   agxdecode_fetch_gpu_array(heap, samp);
+
+   for (unsigned i = 0; i < count; ++i) {
+      fprintf(agxdecode_dump_stream, "Heap sampler %u\n", i);
+
+      agx_unpack(agxdecode_dump_stream, samp + i, SAMPLER, temp);
+      agx_print(agxdecode_dump_stream, SAMPLER, temp,
+                (agxdecode_indent + 1) * 2);
+   }
+}
+
+void
+agxdecode_drm_cmd_render(struct drm_asahi_params_global *params,
+                         struct drm_asahi_cmd_render *c, bool verbose)
+{
+   agxdecode_dump_file_open();
+
+   DUMP_FIELD(c, "%llx", flags);
+   DUMP_FIELD(c, "0x%llx", encoder_ptr);
+   agxdecode_stateful(c->encoder_ptr, "Encoder", agxdecode_vdm, verbose, params,
+                      NULL);
+   DUMP_FIELD(c, "0x%x", encoder_id);
+   DUMP_FIELD(c, "0x%x", cmd_ta_id);
+   DUMP_FIELD(c, "0x%x", cmd_3d_id);
+   DUMP_FIELD(c, "0x%x", ppp_ctrl);
+   DUMP_CL(ZLS_CONTROL, &c->zls_ctrl, "ZLS Control");
+   DUMP_FIELD(c, "0x%llx", depth_buffer_load);
+   DUMP_FIELD(c, "0x%llx", depth_buffer_store);
+   DUMP_FIELD(c, "0x%llx", depth_buffer_partial);
+   DUMP_FIELD(c, "0x%llx", stencil_buffer_load);
+   DUMP_FIELD(c, "0x%llx", stencil_buffer_store);
+   DUMP_FIELD(c, "0x%llx", stencil_buffer_partial);
+   DUMP_FIELD(c, "0x%llx", scissor_array);
+   DUMP_FIELD(c, "0x%llx", depth_bias_array);
+   DUMP_FIELD(c, "%d", fb_width);
+   DUMP_FIELD(c, "%d", fb_height);
+   DUMP_FIELD(c, "%d", layers);
+   DUMP_FIELD(c, "0x%x", load_pipeline);
+   DUMP_FIELD(c, "0x%x", load_pipeline_bind);
+   agxdecode_stateful(c->load_pipeline & ~0x7, "Load pipeline", agxdecode_usc,
+                      verbose, params, NULL);
+   DUMP_FIELD(c, "0x%x", store_pipeline);
+   DUMP_FIELD(c, "0x%x", store_pipeline_bind);
+   agxdecode_stateful(c->store_pipeline & ~0x7, "Store pipeline", agxdecode_usc,
+                      verbose, params, NULL);
+   DUMP_FIELD(c, "0x%x", partial_reload_pipeline);
+   DUMP_FIELD(c, "0x%x", partial_reload_pipeline_bind);
+   agxdecode_stateful(c->partial_reload_pipeline & ~0x7,
+                      "Partial reload pipeline", agxdecode_usc, verbose, params,
+                      NULL);
+   DUMP_FIELD(c, "0x%x", partial_store_pipeline);
+   DUMP_FIELD(c, "0x%x", partial_store_pipeline_bind);
+   agxdecode_stateful(c->partial_store_pipeline & ~0x7,
+                      "Partial store pipeline", agxdecode_usc, verbose, params,
+                      NULL);
+
+   DUMP_FIELD(c, "0x%x", depth_dimensions);
+   DUMP_FIELD(c, "0x%x", isp_bgobjdepth);
+   DUMP_FIELD(c, "0x%x", isp_bgobjvals);
+
+   agxdecode_sampler_heap(c->vertex_sampler_array, c->vertex_sampler_count);
+
+   /* Linux driver doesn't use this, at least for now */
+   assert(c->fragment_sampler_array == c->vertex_sampler_array);
+   assert(c->fragment_sampler_count == c->vertex_sampler_count);
+
+   // TODO: attachments
+
+   agxdecode_map_read_write();
+}
+
+void
+agxdecode_drm_cmd_compute(struct drm_asahi_params_global *params,
+                          struct drm_asahi_cmd_compute *c, bool verbose)
+{
+   agxdecode_dump_file_open();
+
+   DUMP_FIELD(c, "%llx", flags);
+   DUMP_FIELD(c, "0x%llx", encoder_ptr);
+   agxdecode_stateful(c->encoder_ptr, "Encoder", agxdecode_cdm, verbose, params,
+                      NULL);
+   DUMP_FIELD(c, "0x%x", encoder_id);
+   DUMP_FIELD(c, "0x%x", cmd_id);
+
+   agxdecode_sampler_heap(c->sampler_array, c->sampler_count);
+
+   agxdecode_map_read_write();
 }
 
 static void

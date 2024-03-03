@@ -386,10 +386,10 @@ typedef struct shader_info {
 
       struct {
          /** The output primitive type */
-         uint16_t output_primitive;
+         enum mesa_prim output_primitive;
 
          /** The input primitive type */
-         uint16_t input_primitive;
+         enum mesa_prim input_primitive;
 
          /** The maximum number of vertices the geometry shader might write. */
          uint16_t vertices_out;
@@ -588,7 +588,7 @@ typedef struct shader_info {
 
          uint16_t max_vertices_out;
          uint16_t max_primitives_out;
-         uint16_t primitive_type;  /* GL_POINTS, GL_LINES or GL_TRIANGLES. */
+         enum mesa_prim primitive_type;  /* GL_POINTS, GL_LINES or GL_TRIANGLES. */
 
          /* TODO: remove this when we stop supporting NV_mesh_shader. */
          bool nv;

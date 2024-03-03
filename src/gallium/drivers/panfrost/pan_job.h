@@ -142,9 +142,6 @@ struct panfrost_batch {
    /* Job scoreboarding state */
    struct pan_scoreboard scoreboard;
 
-   /* Polygon list bound to the batch, or NULL if none bound yet */
-   struct panfrost_bo *polygon_list;
-
    /* Scratchpad BO bound to the batch, or NULL if none bound yet */
    struct panfrost_bo *scratchpad;
 
@@ -204,6 +201,10 @@ panfrost_get_fresh_batch_for_fbo(struct panfrost_context *ctx,
 
 void panfrost_batch_add_bo(struct panfrost_batch *batch, struct panfrost_bo *bo,
                            enum pipe_shader_type stage);
+
+void panfrost_batch_write_bo(struct panfrost_batch *batch,
+                             struct panfrost_bo *bo,
+                             enum pipe_shader_type stage);
 
 void panfrost_batch_read_rsrc(struct panfrost_batch *batch,
                               struct panfrost_resource *rsrc,

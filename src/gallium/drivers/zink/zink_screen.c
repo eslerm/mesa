@@ -679,7 +679,6 @@ zink_get_param(struct pipe_screen *pscreen, enum pipe_cap param)
       return screen->info.have_NV_compute_shader_derivatives;
 
    case PIPE_CAP_INT64:
-   case PIPE_CAP_INT64_DIVMOD:
    case PIPE_CAP_DOUBLES:
       return 1;
 
@@ -1241,9 +1240,6 @@ zink_get_shader_param(struct pipe_screen *pscreen,
                        screen->info.props.limits.maxPerStageDescriptorSampledImages),
                   PIPE_MAX_SAMPLERS);
 
-   case PIPE_SHADER_CAP_DROUND_SUPPORTED:
-      return 0; /* not implemented */
-
    case PIPE_SHADER_CAP_TGSI_ANY_INOUT_DECL_RANGE:
       return 0; /* no idea */
 
@@ -1478,7 +1474,8 @@ zink_destroy_screen(struct pipe_screen *pscreen)
 
    util_vertex_state_cache_deinit(&screen->vertex_state_cache);
 
-   VKSCR(DestroyPipelineLayout)(screen->dev, screen->gfx_push_constant_layout, NULL);
+   if (screen->gfx_push_constant_layout)
+      VKSCR(DestroyPipelineLayout)(screen->dev, screen->gfx_push_constant_layout, NULL);
 
    u_transfer_helper_destroy(pscreen->transfer_helper);
    if (util_queue_is_initialized(&screen->cache_get_thread)) {
@@ -1494,8 +1491,10 @@ zink_destroy_screen(struct pipe_screen *pscreen)
 #endif
    disk_cache_destroy(screen->disk_cache);
 
+   /* we don't have an API to check if a set is already initialized */
    for (unsigned i = 0; i < ARRAY_SIZE(screen->pipeline_libs); i++)
-      _mesa_set_clear(&screen->pipeline_libs[i], NULL);
+      if (screen->pipeline_libs[i].table)
+         _mesa_set_clear(&screen->pipeline_libs[i], NULL);
 
    zink_bo_deinit(screen);
    util_live_shader_cache_deinit(&screen->shaders);
@@ -1518,11 +1517,17 @@ zink_destroy_screen(struct pipe_screen *pscreen)
    if (screen->bindless_layout)
       VKSCR(DestroyDescriptorSetLayout)(screen->dev, screen->bindless_layout, NULL);
 
-   VKSCR(DestroyDevice)(screen->dev, NULL);
-   VKSCR(DestroyInstance)(screen->instance, NULL);
+   if (screen->dev)
+      VKSCR(DestroyDevice)(screen->dev, NULL);
+
+   if (screen->instance)
+      VKSCR(DestroyInstance)(screen->instance, NULL);
+
    util_idalloc_mt_fini(&screen->buffer_ids);
 
-   util_dl_close(screen->loader_lib);
+   if (screen->loader_lib)
+      util_dl_close(screen->loader_lib);
+
    if (screen->drm_fd != -1)
       close(screen->drm_fd);
 
@@ -1626,6 +1631,12 @@ choose_pdev(struct zink_screen *screen, int64_t dev_major, int64_t dev_minor)
       screen->pdev = pdev;
    }
    VKSCR(GetPhysicalDeviceProperties)(screen->pdev, &screen->info.props);
+
+   /* allow software rendering only if forced by the user */
+   if (!cpu && screen->info.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) {
+      screen->pdev = VK_NULL_HANDLE;
+      return;
+   }
 
    screen->info.device_version = screen->info.props.apiVersion;
 
@@ -2866,6 +2877,16 @@ init_driver_workarounds(struct zink_screen *screen)
    case VK_DRIVER_ID_MESA_TURNIP:
    case VK_DRIVER_ID_QUALCOMM_PROPRIETARY:
       screen->driver_workarounds.broken_cache_semantics = true;
+      break;
+   default:
+      break;
+   }
+
+   /* these drivers can successfully do INVALID <-> LINEAR dri3 modifier swap */
+   switch (screen->info.driver_props.driverID) {
+   case VK_DRIVER_ID_MESA_TURNIP:
+   case VK_DRIVER_ID_MESA_VENUS:
+      screen->driver_workarounds.can_do_invalid_linear_modifier = true;
       break;
    default:
       break;
